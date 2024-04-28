@@ -50,17 +50,23 @@ using csce438::AllUsers;
 using csce438::TLFL;
 
 int synchID = 1;
+int clusterID = 1;
 std::vector<std::string> get_lines_from_file(std::string);
 void run_synchronizer(std::string,std::string,std::string,int);
 std::vector<std::string> get_all_users_func(int);
 std::vector<std::string> get_tl_or_fl(int, int, bool);
 
 std::unique_ptr<csce438::CoordService::Stub> coordinator_stub_;
-
+std::vector<std::string> remove_dups(std::vector<std::string> vec) {
+    std::sort(vec.begin(), vec.end());
+    vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+    return vec;
+}
 class SynchServiceImpl final : public SynchService::Service {
     Status GetAllUsers(ServerContext* context, const Confirmation* confirmation, AllUsers* allusers) override{
         //std::cout<<"Got GetAllUsers"<<std::endl;
         std::vector<std::string> list = get_all_users_func(synchID);
+
         //package list
         for(auto s:list){
             allusers->add_users(s);
@@ -151,6 +157,10 @@ int main(int argc, char** argv) {
                 break;
             case 'i':
                 synchID = std::stoi(optarg);
+                clusterID = synchID;
+                if (synchID > 3) {
+                    clusterID = synchID - 3;
+                }
                 break;
             default:
                 std::cerr << "Invalid Command Line Argument\n";
@@ -168,7 +178,7 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
     std::unique_ptr<CoordService::Stub> coord_stub_;
     coord_stub_ = std::unique_ptr<CoordService::Stub>(CoordService::NewStub(grpc::CreateChannel(target_str, grpc::InsecureChannelCredentials())));
     //std::cout<<"MADE STUB"<<std::endl;
-
+    std::cout << "Set up coordinator stub" << std::endl;
     ServerInfo msg;
     Confirmation c;
     grpc::ClientContext context;
@@ -179,43 +189,130 @@ void run_synchronizer(std::string coordIP, std::string coordPort, std::string po
     msg.set_type("follower");
 
     //send init heartbeat
-
+    coord_stub_->Heartbeat(&context, msg, &c);
     //TODO: begin synchronization process
     while(true){
         //change this to 30 eventually
         sleep(20);
         //synch all users file 
             //get list of all followers
+        ServerList sl;
+        ClientContext cc;
+        std::cout << "Got all synch servers" << std::endl;
+        coord_stub_->AllSynchServers(&cc, msg, &sl);
 
             // YOUR CODE HERE
             //set up stub
             //send each a GetAllUsers request
+            AllUsers au;
+            std::vector<std::string> allUsers;
+
             //aggregate users into a list
             //sort list and remove duplicates
+            for (int i = 0; i < sl.serverid_size(); i++) {
+                std::string follower_addr = sl.hostname(i) + ":" + sl.port(i);
+                std::cout << "Got follower address at: " << follower_addr << std::endl;
+                std::unique_ptr<SynchService::Stub> sync_stub_ = std::unique_ptr<SynchService::Stub>(SynchService::NewStub(grpc::CreateChannel(follower_addr, grpc::InsecureChannelCredentials())));
+                ClientContext cc;
+                Confirmation conf;
+                sync_stub_->GetAllUsers(&cc, c, &au);
+                for (int j = 0; j < au.users_size(); j++) {
+                    allUsers.push_back(au.users(j));
+                }
 
+                
+            }
+            allUsers = remove_dups(allUsers);
             // YOUR CODE HERE
-
+            std::cout << "All users sorted" << std::endl;
             //for all the found users
             //if user not managed by current synch
             // ...
- 
+            std::set<std::string> managedUsers;
+            std::unique_ptr<SynchService::Stub> sync_stub_ = std::unique_ptr<SynchService::Stub>(SynchService::NewStub(grpc::CreateChannel("127.0.0.1:"+port, grpc::InsecureChannelCredentials())));
+            Confirmation conf;
+            ClientContext cc2;
+            // sync_stub_->GetAllUsers(&cc2, c, &au);
+            std::vector<std::string> tempVec = get_lines_from_file("./cluster"+std::to_string(clusterID)+"/1/cluster_users.txt");
+            for (int j = 0; j < tempVec.size(); j++) {
+                managedUsers.insert(tempVec[j]);
+            }
+            
+            for (int i = 0; i < allUsers.size(); i++) {
+                
+                if (managedUsers.find(allUsers[i]) != managedUsers.end()) {
+                    std::cout << "Managed User: " << allUsers[i] << std::endl;
+                    std::string currFileNameMaster = "./cluster"+std::to_string(clusterID)+"/" + std::to_string(i) + "_follow_list.txt";
+
+                    std::vector<std::string> following_users = remove_dups(get_lines_from_file(currFileNameMaster));
+                    for (std::string following : following_users) {
+                        int currId = std::stoi(following);
+                        int intClusterId = ((currId - 1) % 3) + 1;
+                        // set id
+                        ClientContext context;
+                        ID id; 
+                        ServerInfo serverinfo;
+                        id.set_id(intClusterId);
+                        coord_stub_->GetSynchronizer(&context, id, &serverinfo);
+                        std::string currAddr = serverinfo.hostname() + ":" + serverinfo.port();
+                        
+                    }
+
+                } else {
+                    std::cout << "User: " << allUsers[i] << std::endl;
+                    // Get check if user is following one of the managed users
+                    int currId = std::stoi(allUsers[i]);
+                    int intClusterId = ((currId - 1) % 3) + 1;
+                    ID id; 
+                    ServerInfo serverinfo;
+                    id.set_id(intClusterId);
+                    ClientContext currCC;
+                    coord_stub_->GetSynchronizer(&currCC, id, &serverinfo);
+                    std::string currAddr = serverinfo.hostname() + ":" + serverinfo.port();
+
+                    std::cout<<currAddr << std::endl;
+                    sync_stub_ = std::unique_ptr<SynchService::Stub>(SynchService::NewStub(grpc::CreateChannel(currAddr, grpc::InsecureChannelCredentials())));
+                    TLFL tlfl;
+                    ID tempId;
+                    ClientContext currCC2;
+                    tempId.set_id(currId);
+                    sync_stub_->GetTLFL(&currCC2, tempId, &tlfl);
+                    for (int z = 0; z < tlfl.fl_size(); z++) {
+                        if (managedUsers.find(tlfl.fl(z)) != managedUsers.end()) {
+                            int temp = ((std::stoi(tlfl.fl(z)) - 1) % 3) + 1;
+                            std::string followersFileMaster = "./cluster"+std::to_string(temp)+"/1/"+tlfl.fl(z)+".txt";
+                            std::string followersFileSlave = "./cluster"+std::to_string(temp)+"/2/"+tlfl.fl(z)+".txt";
+                            std::ofstream fileMaster(followersFileMaster, std::ios_base::app);
+                            std::ofstream fileSlave(followersFileSlave, std::ios_base::app);
+                            if (fileMaster.is_open()) {
+                                fileMaster.seekp(0, std::ios_base::beg);
+                                fileMaster << std::to_string(i) << "\n";
+                                fileSlave << std::to_string(i) << "\n";
+                                fileMaster.close();
+                                fileSlave.close();
+                            }
+                        }
+                    }
+                }
+                // std::string slave_prefix = "./cluster" + 
+            }
             // YOUR CODE HERE
 
 	    //force update managed users from newly synced users
             //for all users
-            for(auto i : aggregated_users){
-                //get currently managed users
-                //if user IS managed by current synch
-                    //read their follower lists
-                    //for followed users that are not managed on cluster
-                    //read followed users cached timeline
-                    //check if posts are in the managed tl
-                    //add post to tl of managed user    
+            // for(auto i : aggregated_users){
+            //     //get currently managed users
+            //     //if user IS managed by current synch
+            //         //read their follower lists
+            //         //for followed users that are not managed on cluster
+            //         //read followed users cached timeline
+            //         //check if posts are in the managed tl
+            //         //add post to tl of managed user    
             
-                     // YOUR CODE HERE
-                    }
-                }
-            }
+            //          // YOUR CODE HERE
+            //         }
+            //     }
+            // }
     }
     return;
 }
@@ -265,24 +362,25 @@ bool file_contains_user(std::string filename, std::string user){
 
 std::vector<std::string> get_all_users_func(int synchID){
     //read all_users file master and client for correct serverID
-    std::string master_users_file = "./master"+std::to_string(synchID)+"/all_users";
-    std::string slave_users_file = "./slave"+std::to_string(synchID)+"/all_users";
+    std::string master_users_file = "./cluster"+std::to_string(clusterID)+"/1/all_users.txt";
+    // std::string slave_users_file = "./cluster"+std::to_string(synchID)+"/2/all_users";
     //take longest list and package into AllUsers message
     std::vector<std::string> master_user_list = get_lines_from_file(master_users_file);
-    std::vector<std::string> slave_user_list = get_lines_from_file(slave_users_file);
+    // std::vector<std::string> slave_user_list = get_lines_from_file(slave_users_file);
 
-    if(master_user_list.size() >= slave_user_list.size())
-        return master_user_list;
-    else
-        return slave_user_list;
+    // if(master_user_list.size() >= slave_user_list.size())
+    //     return master_user_list;
+    // else
+    //     return slave_user_list;
+    return master_user_list;
 }
 
 std::vector<std::string> get_tl_or_fl(int synchID, int clientID, bool tl){
-    std::string master_fn = "./master"+std::to_string(synchID)+"/"+std::to_string(clientID);
-    std::string slave_fn = "./slave"+std::to_string(synchID)+"/" + std::to_string(clientID);
+    std::string master_fn = "./cluster"+std::to_string(clusterID)+"/1/"+std::to_string(clientID);
+    std::string slave_fn = "./cluster"+std::to_string(clusterID)+"/2/" + std::to_string(clientID);
     if(tl){
-        master_fn.append("_timeline");
-        slave_fn.append("_timeline");
+        master_fn.append(".txt");
+        slave_fn.append(".txt");
     }else{
         master_fn.append("_follow_list");
         slave_fn.append("_follow_list");

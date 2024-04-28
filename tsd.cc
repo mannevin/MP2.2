@@ -59,6 +59,8 @@
 #include "coordinator.pb.h"
 #include "client.h"
 
+#include <sys/stat.h>
+
 
 using google::protobuf::Timestamp;
 using google::protobuf::Duration;
@@ -103,11 +105,69 @@ void checkHeartbeat();
 std::time_t getTimeNow();
 
 std::unique_ptr<csce438::CoordService::Stub> coordinator_stub_;
-
+std::unique_ptr<csce438::SNSService::Stub> follower_stub_;
+std::string currType;
+std::string prefix;
 // coordinator rpcs
 IReply Heartbeat(std::string clusterId, std::string serverId, std::string hostname, std::string port);
 
+bool forward_command(std::string command, std::string arg1, std::string arg2) {
+    std::cout << "Forwarding command to slave" << std::endl;
+    ClientContext context;
+    csce438::ID id; 
+    csce438::ServerInfo serverinfo;
 
+    int userId = std::stoi(arg1);
+    
+    id.set_id(((userId - 1) % 3) + 1);
+    Status status = coordinator_stub_->GetSlave(&context, id, &serverinfo);
+    if (serverinfo.type() == "not found") {
+        return false;
+    }
+    std::string slave_hostname = serverinfo.hostname();
+    std::string slave_port = serverinfo.port();
+    std::string slave_address = slave_hostname + ":" + slave_port;
+    std::cout << "Slave found at: " << slave_address << std::endl;
+    grpc::ChannelArguments channel_args2;
+
+    std::shared_ptr<grpc::Channel> channel2 = grpc::CreateCustomChannel(
+            slave_address, grpc::InsecureChannelCredentials(), channel_args2);
+    follower_stub_ = csce438::SNSService::NewStub(channel2);
+    Request request;
+    Reply reply;
+    if (command == "follow") {
+        std::cout << "Forwarding follow command to slave from user " << arg1 << " to " << arg2 << std::endl;
+        ClientContext cc;
+        request.set_username(arg1);
+        request.add_arguments(arg2);
+
+        grpc::Status status = follower_stub_->Follow(&cc, request, &reply);
+    } else if (command == "login") {
+        std::cout << "Forwarding login command to slave" << std::endl;
+        ClientContext cc;
+        request.set_username(arg1);
+        grpc::Status status = follower_stub_->Login(&cc, request, &reply);
+    } else if (command == "timeline") {
+        std::cout << "Forwarding timeline command to slave" << std::endl;
+        // just write to file
+        
+        return true;
+    }
+    
+    return true;
+}
+std::vector<std::string> lineReader(std::string filename) {
+    std::vector<std::string> items;
+    std::ifstream readFile(filename);
+    std::string temp;
+    while (getline(readFile, temp)) {
+        items.push_back(temp);
+    }
+    readFile.close();
+    std::sort(items.begin(), items.end());
+    items.erase(std::unique(items.begin(), items.end()), items.end());
+    return items;
+}
 //Vector that stores every client that has been created
 /* std::vector<Client*> client_db; */
 
@@ -149,23 +209,23 @@ class SNSServiceImpl final : public SNSService::Service {
     Status List(ServerContext* context, const Request* request, ListReply* list_reply) override {
 
         // add all known clients to the all_users vector
-        for (const auto& pair : client_db){
-            list_reply->add_all_users(pair.first);
+        std::string allUsersFile = prefix + "all_users.txt";
+        std::vector<std::string> allUsers = lineReader(allUsersFile);
+
+        for (std::string line : allUsers){
+            // line[strlen(line.c_str())-1] = '\0';
+            list_reply->add_all_users(line);
         }
 
         std::string username = request->username();
 
         // add all the followers of the client to the folowers vector
         Client* c = getClient(username);
-        if (c != NULL){
-            for (Client* x : c->client_followers){
-                list_reply->add_followers(x->username);
-            }
-
-        } else {
-            return Status::CANCELLED;
+        std::string followingFile = prefix + username + "_follow_list.txt";
+        std::vector<std::string> followers = lineReader(followingFile);
+        for (std::string f : followers){
+            list_reply->add_followers(f);
         }
-
         return Status::OK;
     }
 
@@ -196,7 +256,21 @@ class SNSServiceImpl final : public SNSService::Service {
         // add the clients to each other's relevant vector
         c1->client_following.push_back(c2);
         c2->client_followers.push_back(c1);
-
+        std::ofstream followerFile(prefix + u1 + "_follow_list.txt", std::ios_base::app);
+        std::ofstream followingFile(prefix + u2 + "_following_list.txt", std::ios_base::app);
+        if (followerFile.is_open()) {
+            followerFile.seekp(0, std::ios_base::beg);
+            followerFile << u2 << "\n";
+            followerFile.close();
+        }
+        if (followingFile.is_open()) {
+            followingFile.seekp(0, std::ios_base::beg);
+            followingFile << u1 << "\n";
+            followingFile.close();
+        }
+        if (currType == "master") {
+            forward_command("follow", u1, u2);
+        }
         return Status::OK; 
     }
 
@@ -286,8 +360,19 @@ class SNSServiceImpl final : public SNSService::Service {
             newc->last_heartbeat = getTimeNow();
             newc->missed_heartbeat = false;
             client_db[username] = newc;
-        }
+            std::ofstream allUserFile(prefix + "all_users.txt", std::ios_base::app);
+            std::ofstream clusterFile(prefix + "cluster_users.txt", std::ios_base::app);
 
+            if (allUserFile.is_open()) {
+                allUserFile.seekp(0, std::ios_base::beg);
+                allUserFile << username << "\n";
+                clusterFile << username << "\n";
+                allUserFile.close();
+            }
+        }
+        if (currType == "master") {
+            forward_command("login", username, "");
+        }
         return Status::OK;
     }
 
@@ -317,11 +402,12 @@ class SNSServiceImpl final : public SNSService::Service {
             c = getClient(u);
             c->stream = stream; // set the client's stream to be the current stream
         }
-
+    
         // if this is the first time the client is logging back 
         if (firstTimelineStream && c != nullptr) {
             // Read latest 20 messages from following file
-            std::ifstream followingFile(u + "_following.txt");
+
+            std::ifstream followingFile(prefix + u + "_timeline.txt");
             if (followingFile.is_open()) {
                 std::string line;
                 while (std::getline(followingFile, line)) {
@@ -363,7 +449,8 @@ class SNSServiceImpl final : public SNSService::Service {
                 std::string ffo = u + '(' + time_str + ')' + " >> " + m.msg();
 
                 // Append to user's timeline file
-                std::ofstream userFile(u + ".txt", std::ios_base::app);
+                std::cout << prefix + u + ".txt" << std::endl;
+                std::ofstream userFile(prefix + u + ".txt", std::ios_base::app);
                 if (userFile.is_open()) {
                     userFile.seekp(0, std::ios_base::beg);
                     userFile << ffo;
@@ -385,8 +472,10 @@ class SNSServiceImpl final : public SNSService::Service {
                 }
 
                 // Append to  all the followers' following file
+
                 for (Client* follower : c->client_followers) {
-                    std::ofstream followerFile(follower->username + "_following.txt", std::ios_base::app);
+                    std::ofstream followerFile(prefix + follower->username + "_timeline.txt", std::ios_base::app); 
+                    
                     if (followerFile.is_open()) {
                         followerFile.seekp(0, std::ios_base::beg);
                         followerFile << ffo;
@@ -426,9 +515,15 @@ IReply Heartbeat(std::string clusterId, std::string serverId, std::string hostna
     serverinfo.set_port(port);
 
     grpc::Status status = coordinator_stub_->Heartbeat(&context, serverinfo, &confirmation);
+    if (confirmation.type() == "master" && currType != "master") {
+        // need to switch from slave to master
+        std::cout << "Server: Switching from slave to master\n";
+        currType = "master";
+        // prefix = "./cluster" + clusterId + "/1/";
+    }
     if (status.ok()){
         ire.grpc_status = status;
-    }else { // professor said in class that since the servers cannot be run without a coordinator, you should exit
+    }else { 
 
         ire.grpc_status = status;
         std::cout << "coordinator not found! exiting now...\n";
@@ -470,9 +565,8 @@ void RunServer(std::string clusterId, std::string serverId, std::string coordina
 
     // need to first create a stub to communicate with the coordinator to get the info of the server to connect to
     std::string coordinator_address = coordinatorIP + ":" + coordinatorPort;
-    grpc::ChannelArguments channel_args;
-    std::shared_ptr<grpc::Channel> channel = grpc::CreateCustomChannel(
-            coordinator_address, grpc::InsecureChannelCredentials(), channel_args);
+    std::shared_ptr<grpc::Channel> channel = grpc::CreateChannel(
+            coordinator_address, grpc::InsecureChannelCredentials());
 
     // Instantiate the coordinator stub
     coordinator_stub_ = csce438::CoordService::NewStub(channel);
@@ -544,7 +638,19 @@ int main(int argc, char** argv) {
         }
     }
 
-
+    int intServerId = std::stoi(serverId);
+    if (intServerId == 1) {
+        currType = "master";
+    } else if (intServerId == 2) {
+        currType == "slave";
+    }
+    prefix = "./";
+    prefix = prefix + "cluster" + clusterId;
+    if (mkdir(prefix.c_str(), 0777) == -1) {}
+    prefix = prefix + "/" + serverId;
+    if (mkdir(prefix.c_str(), 0777) == -1) {}
+    prefix = prefix + "/";
+    std::cout << "Prefix set to: " << prefix << std::endl;
     std::string log_file_name = std::string("server-") + port;
     google::InitGoogleLogging(log_file_name.c_str());
     log(INFO, "Logging Initialized. Server starting...");

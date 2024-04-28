@@ -11,6 +11,9 @@ import "google/protobuf/timestamp.proto";
 service CoordService{
     rpc Heartbeat (ServerInfo) returns (Confirmation) {}
     rpc GetServer (ID) returns (ServerInfo) {}
+    rpc GetSlave  (ID) returns (ServerInfo) {}
+    rpc GetSynchronizer  (ID) returns (ServerInfo) {}
+    rpc AllSynchServers (ServerInfo) returns (ServerList) {}
     /* // ZooKeeper API here */
     /* // Create a path and place data in the znode */
     /* rpc create (PathAndData) returns (Status) {} */
@@ -34,6 +37,7 @@ message ServerInfo{
 //confirmation message definition
 message Confirmation{
     bool status = 1;
+    string type = 2;
 }
 
 //id message definition

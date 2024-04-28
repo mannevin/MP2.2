@@ -50,16 +50,23 @@ struct zNode{
     bool isActive();
 
 };
-
+struct fNode{
+    int synchId;
+    std::string type;
+    std::string hostname;
+    std::string port;
+};
 //potentially thread safe 
 std::mutex v_mutex;
 std::vector<zNode*> cluster1;
 std::vector<zNode*> cluster2;
 std::vector<zNode*> cluster3;
-
+std::vector<fNode*> c1Synch;
+std::vector<fNode*> c2Synch;
+std::vector<fNode*> c3Synch;
 // creating a vector of vectors containing znodes
 std::vector<std::vector<zNode*>> clusters = {cluster1, cluster2, cluster3};
-
+std::vector<std::vector<fNode*>> synchs = {c1Synch, c2Synch, c3Synch};
 
 //func declarations
 int findServer(std::vector<zNode*> v, int id); 
@@ -82,9 +89,9 @@ int findServer(std::vector<zNode*> v, int id){
         v_mutex.unlock();
         return 0;
     }
-
+    
     v_mutex.unlock();
-
+    std::cout << "Did not find server\n";
     // at this point no appropriate server was found
     return -1;  
 }
@@ -102,6 +109,18 @@ bool zNode::isActive(){
 
 
 class CoordServiceImpl final : public CoordService::Service {
+    Status AllSynchServers(ServerContext* context, const ServerInfo* serverinfo, ServerList* serverlist) override {
+        std::cout << "Getting All Follower Synchrizer Servers\n";
+        for (std::vector<fNode*> curr : synchs) {
+            if (curr.size() > 0) {
+                std::cout << curr[0]->synchId << "----" << curr[0]->hostname << "----" << curr[0]->port << std::endl;
+                serverlist->add_serverid(curr[0]->synchId);
+                serverlist->add_hostname(curr[0]->hostname);
+                serverlist->add_port(curr[0]->port);
+            }
+        }
+        return Status::OK;
+    }
 
     Status Heartbeat(ServerContext* context, const ServerInfo* serverinfo, Confirmation* confirmation) override {
 
@@ -118,10 +137,35 @@ class CoordServiceImpl final : public CoordService::Service {
             clusterid = customValue;
             intClusterid = std::stoi(clusterid);
         }
-
+        if (serverinfo->type() == "follower") {
+            std::cout << "Started follower synchronizer " << std::endl;
+            fNode * fN = new fNode();
+            int idx = serverinfo->serverid();
+            if (idx > 3) {
+                idx = idx - 3;
+            }
+            std::cout << "Cluster ID: " << idx << std::endl;
+            if (synchs[idx-1].size() == 0) {
+                fN->type = "master";
+            } else {
+                fN->type = "slave";
+            }
+            fN->hostname = serverinfo->hostname();
+            fN->port = serverinfo->port();
+            fN->synchId = serverinfo->serverid();
+            synchs[idx-1].push_back(fN);
+            return Status::OK;
+        }
         std::cout<<"Got Heartbeat! Serverid:"<<serverinfo->type()<<"("<<serverinfo->serverid()<<") and clusterid: (" << clusterid << ")\n";
 
         auto it2 = metadata.find("heartbeat");
+        // if (serverinfo->serverid() == 1) {
+        //     std::cout << "Set type to master\n";
+        //     confirmation->set_type("master");
+        // } else if (serverinfo->serverid() == 2) {
+        //     std::cout << "Set type to slave\n";
+        //     confirmation->set_type("slave");
+        // }
         if (it2 != metadata.end()) { // HEARTBEAT RECEIVED
             // customValue2 is the heartbeat from the metadata received from the server
             std::string customValue2(it2->second.data(), it2->second.length());
@@ -146,12 +190,12 @@ class CoordServiceImpl final : public CoordService::Service {
             int curIndex = findServer(clusters[intClusterid-1], serverinfo->serverid());
 
             // server is resurrected after it was killed in the past
-            if (curIndex != -1){
+            if (curIndex != -1 && curIndex != 0){
                 v_mutex.lock();
 
                 zNode* curZ = clusters[intClusterid - 1][curIndex];
                 curZ->last_heartbeat = getTimeNow(); // updating the latest heartbeat value for the server
-
+                
                 v_mutex.unlock();
 
                 std::cout << "an inactive server was resurrected" << "\n";
@@ -162,10 +206,16 @@ class CoordServiceImpl final : public CoordService::Service {
                 z->hostname = serverinfo->hostname();
                 z->port = serverinfo->port();
                 z->serverID = serverinfo->serverid();
-                z->type = serverinfo->type(); 
+                if (serverinfo->serverid() == 1) {
+                    std::cout << "Set type to master\n";
+                    z->type = "master";
+                } else if (serverinfo->serverid() == 2) {
+                    std::cout << "Set type to slave\n";
+                    z->type = "slave";
+                }
                 z->last_heartbeat = getTimeNow();
 
-
+                
                 v_mutex.lock();
 
                 // adding the newly created server to its relevant cluster
@@ -175,9 +225,27 @@ class CoordServiceImpl final : public CoordService::Service {
 
             }
         }
+        v_mutex.lock();
+        std::vector<zNode*> currCluster = clusters[intClusterid-1];
+        for (auto zN : currCluster) {
+            if (zN->type == "master" && !zN->isActive()) {
+                std::cout << "Switching to Slave\n";
+                // TODO erase master
+                clusters[intClusterid-1].erase(clusters[intClusterid-1].begin());
+                synchs[intClusterid-1].erase(synchs[intClusterid-1].begin());
+                synchs[intClusterid-1][0]->type = "master";
+                std::cout << "Erased Master Cluster Successfully, vector size: " << currCluster.size() << std::endl;
+                for (auto zN2 : currCluster) {
+                    if (zN2->type == "slave" && zN2->isActive()) {
+                        zN2->type = "master";
+                        confirmation->set_type("master");
+                    }
+                }
+            }
+        }
+        v_mutex.unlock();
 
         // Your code here
-
         return Status::OK;
     }
 
@@ -192,7 +260,7 @@ class CoordServiceImpl final : public CoordService::Service {
         // If server is active, return serverinfo
 
         // finding a server to assign to the new client
-        int curIndex = findServer(clusters[clusterId-1], clusterId);
+        int curIndex = findServer(clusters[clusterId-1], 0);
 
         if (curIndex != -1){
             v_mutex.lock();
@@ -210,8 +278,40 @@ class CoordServiceImpl final : public CoordService::Service {
 
         return Status::OK;
     }
+    Status GetSynchronizer(ServerContext* context, const ID* id, ServerInfo* serverinfo) override {
+        std::cout<<"Got GetServer for clientID: "<<id->id()<<std::endl;
+        int clusterId = ((id->id() - 1) % 3) + 1;
 
+        // Your code here
+        // If server is active, return serverinfo
 
+        // finding a server to assign to the new client
+
+        v_mutex.lock();
+        fNode* currF = synchs[clusterId - 1][0];
+        v_mutex.unlock();
+        serverinfo->set_hostname(currF->hostname);
+        serverinfo->set_port(currF->port);
+        return Status::OK;
+    }
+    Status GetSlave(ServerContext* context, const ID* id, ServerInfo* serverinfo) override {
+        int clusterId = id->id();
+        std::vector<zNode*> currCluster = clusters[clusterId-1];
+        bool found = false;
+        for (auto zN : currCluster) {
+            if (zN->type == "slave") {
+                std::cout << "FOUND SLAVE" << std::endl;
+                serverinfo->set_hostname(zN->hostname);
+                serverinfo->set_port(zN->port);
+                found = true;
+            }
+        }
+        if (!found) {
+            serverinfo->set_type("not found");
+            std::cout << "Slave not found\n";
+        }
+        return Status::OK;
+    }
 };
 
 void RunServer(std::string port_no){
